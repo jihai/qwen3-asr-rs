@@ -1,7 +1,6 @@
 use qwen3_asr::{AsrInference, TranscribeOptions};
 
 use anyhow::Result;
-use candle_core::Device;
 use std::path::PathBuf;
 
 fn main() -> Result<()> {
@@ -12,10 +11,7 @@ fn main() -> Result<()> {
 
     let audio_dir = PathBuf::from("audio");
 
-    let device = Device::new_metal(0).unwrap_or_else(|_| {
-        eprintln!("Metal not available, using CPU");
-        Device::Cpu
-    });
+    let device = qwen3_asr::best_device();
     eprintln!("Device: {:?}", device);
 
     let model_dir = model_dir_arg

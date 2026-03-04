@@ -12,7 +12,6 @@
 ///   - Wall-clock throughput (audio-seconds transcribed per second)
 
 use anyhow::Result;
-use candle_core::Device;
 use qwen3_asr::{AsrInference, TranscribeOptions};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -225,7 +224,7 @@ fn wav_duration_secs(path: &Path) -> f64 {
 fn main() -> Result<()> {
     let cli = parse_args();
 
-    let device = Device::new_metal(0).unwrap_or(Device::Cpu);
+    let device = qwen3_asr::best_device();
 
     println!();
     println!("═══════════════════════════════════════════════════════════");

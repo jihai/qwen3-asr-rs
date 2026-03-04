@@ -5,8 +5,8 @@ Pure-Rust inference engine for **Qwen3-ASR** automatic speech recognition models
 ## Features
 
 - **All model sizes** — 0.6B and 1.7B work out of the box; select the model directory at runtime
-- **Metal GPU acceleration** — Apple Silicon (M1/M2/M3/M4) via candle's Metal backend
-- **CUDA support** — enable the `cuda` feature for NVIDIA GPUs
+- **Metal GPU acceleration** — Apple Silicon (M1/M2/M3/M4) via candle's Metal backend (default)
+- **CUDA GPU acceleration** — NVIDIA GPUs via candle's CUDA backend (`--features cuda`)
 - **Multilingual** — English, Chinese, and code-switched audio (mixed-language)
 - **Sharded weights** — loads both single-file and multi-shard `safetensors` models
 - **Accurate mel extraction** — matches the official `WhisperFeatureExtractor` (Slaney-normalized, 128 mel bins)
@@ -98,11 +98,10 @@ Audio → Mel spectrogram (128 bins) → Conv2d ×3 downsampler
 With the `hub` feature, no manual download is needed:
 
 ```rust
-use qwen3_asr::{AsrInference, TranscribeOptions};
-use candle_core::Device;
+use qwen3_asr::{AsrInference, TranscribeOptions, best_device};
 use std::path::Path;
 
-let device = Device::new_metal(0).unwrap_or(Device::Cpu);
+let device = best_device(); // CUDA → Metal → CPU (based on enabled features)
 let engine = AsrInference::from_pretrained(
     "Qwen/Qwen3-ASR-0.6B",
     Path::new("models/"),
@@ -217,13 +216,139 @@ Both models run well below real-time on Apple M4 Metal. Short samples show highe
 | `rustfft` | FFT for mel spectrogram |
 | `safetensors` | Model weight loading |
 
-## Enabling CUDA
+## Device Selection
 
-Pass `--features cuda` (and disable the default Metal feature) when building on Linux/Windows with an NVIDIA GPU:
+`qwen3_asr::best_device()` automatically selects the best available backend based on compile-time features:
+
+| Priority | Feature | Backend | Typical Platform |
+|----------|---------|---------|-----------------|
+| 1 | `cuda` | NVIDIA CUDA | Linux / Windows with NVIDIA GPU |
+| 2 | `metal` (default) | Apple Metal | macOS with Apple Silicon |
+| 3 | *(fallback)* | CPU | Any platform |
+
+### Build examples
 
 ```bash
+# Apple Silicon (Metal, default)
+cargo run --release
+
+# NVIDIA GPU (CUDA)
 cargo run --release --no-default-features --features cuda
+
+# CPU only
+cargo run --release --no-default-features
 ```
+
+### As a library dependency
+
+```toml
+# Cargo.toml — Metal (macOS default)
+[dependencies]
+qwen3-asr = "0.1"
+
+# Cargo.toml — CUDA (Linux / Windows)
+[dependencies]
+qwen3-asr = { version = "0.1", default-features = false, features = ["cuda"] }
+
+# Cargo.toml — CPU only
+[dependencies]
+qwen3-asr = { version = "0.1", default-features = false }
+```
+
+Then in your code:
+
+```rust
+use qwen3_asr::{AsrInference, TranscribeOptions, best_device};
+
+let device = best_device();
+let engine = AsrInference::load("path/to/model", device)?;
+let result = engine.transcribe("audio.wav", TranscribeOptions::default())?;
+println!("{}", result.text);
+```
+
+## Streaming Transcription
+
+This crate provides a streaming API for low-latency, real-time transcription (live subtitles, voice assistants, meeting captioning).
+
+### Basic usage
+
+```rust
+let mut state = engine.init_streaming(StreamingOptions::default());
+
+// Feed audio chunks as they arrive from the microphone
+for chunk in mic_chunks {
+    if let Some(result) = engine.feed_audio(&mut state, &chunk)? {
+        display_subtitle(&result.text);
+    }
+}
+
+let final_result = engine.finish_streaming(&mut state)?;
+```
+
+### How it works
+
+The streaming algorithm follows Qwen3-ASR's chunked AED with prefix conditioning:
+
+1. Audio accumulates in an internal buffer; every `chunk_size_sec` (default 2s) triggers inference
+2. The encoder uses windowed attention (104 tokens / ~16s window) — completed windows are cached, only the current partial window is recomputed
+3. The decoder generates text conditioned on a **prefix** built from the previous output minus the last `unfixed_token_num` tokens (rollback strategy)
+4. For the first `unfixed_chunk_num` chunks (cold start), no prefix is used
+
+### Memory and duration limits
+
+Each streaming step re-encodes all accumulated audio from scratch (mel extraction, decoder prefill). This is by design — the official Python implementation does the same. Costs grow with session duration:
+
+| Duration | Audio tokens | Mel extraction | Decoder prefill | Practical |
+|----------|-------------|----------------|-----------------|-----------|
+| 2 min | ~780 | fast | fast | smooth |
+| 10 min | ~3,900 | noticeable | ~1s/step | acceptable |
+| 20 min | ~7,800 | slow | ~3-5s/step | upper limit |
+| 60 min | ~23,400 | very slow | 10s+/step | not feasible |
+
+The official Qwen3-ASR technical report states the model supports "single speech no longer than 20 minutes" for streaming.
+
+### Recommended patterns for production
+
+**Short sessions (< 20 min)** — use the streaming API directly:
+
+```rust
+let mut state = engine.init_streaming(StreamingOptions::default());
+// feed_audio / finish_streaming as usual
+```
+
+**Long-running streams (meetings, lectures)** — reset sessions at silence boundaries using VAD. Starting a new session is instant (zero-cost struct init, no model reload):
+
+```rust
+let mut state = engine.init_streaming(opts.clone());
+
+loop {
+    let chunk = read_mic();
+    if vad_detects_silence(&chunk, threshold) {
+        let result = engine.finish_streaming(&mut state)?;
+        save_transcript(&result);
+        state = engine.init_streaming(opts.clone()); // instant, zero cost
+    } else {
+        if let Some(result) = engine.feed_audio(&mut state, &chunk)? {
+            display_subtitle(&result.text);
+        }
+    }
+}
+```
+
+This keeps each session short (one utterance or a few sentences), so memory and latency stay constant. This pattern can run indefinitely.
+
+**Long pre-recorded files (podcasts, recordings)** — do not use streaming. Instead, split the audio into segments at the app layer and call `transcribe_samples()` on each:
+
+```rust
+let segments = split_at_silence(&audio); // your VAD / energy-based splitter
+for seg in &segments {
+    let result = engine.transcribe_samples(seg, TranscribeOptions::default())?;
+    output.push(result.text);
+}
+let full_text = output.join("");
+```
+
+This matches the official Qwen3-ASR approach — their `transcribe()` uses `split_audio_into_chunks()` (energy-based splitting, max 1200s per segment) and processes segments independently.
 
 ## Implementation Notes
 

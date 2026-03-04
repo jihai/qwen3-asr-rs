@@ -12,22 +12,22 @@ use crate::error::AsrError;
 use crate::mel::{load_audio_wav, MelExtractor};
 
 // Special token IDs
-const IM_END_TOKEN_ID: i64 = 151645;
-const ENDOFTEXT_TOKEN_ID: i64 = 151643;
+pub(crate) const IM_END_TOKEN_ID: i64 = 151645;
+pub(crate) const ENDOFTEXT_TOKEN_ID: i64 = 151643;
 // ASR-specific separator token (not in base Qwen3 tokenizer vocab, hence decodes to "")
-const ASR_TEXT_SEP_TOKEN_ID: u32 = 151704;
+pub(crate) const ASR_TEXT_SEP_TOKEN_ID: u32 = 151704;
 
-const MEL_SAMPLE_RATE: u32 = 16000;
+pub(crate) const MEL_SAMPLE_RATE: u32 = 16000;
 const N_FFT:           usize = 400; // Whisper-compatible FFT window (25ms @ 16kHz)
 const HOP_LENGTH:      usize = 160; // Whisper-compatible hop size  (10ms @ 16kHz)
 
 // Prompt structure token IDs (Qwen3 chat template)
-const TOK_IM_START:  i64 = 151644; // <|im_start|>
-const TOK_SYSTEM:    i64 = 8948;   // "system"
-const TOK_NEWLINE:   i64 = 198;    // "\n"
-const TOK_IM_END:    i64 = IM_END_TOKEN_ID; // 151645
-const TOK_USER:      i64 = 872;    // "user"
-const TOK_ASSISTANT: i64 = 77091;  // "assistant"
+pub(crate) const TOK_IM_START:  i64 = 151644; // <|im_start|>
+pub(crate) const TOK_SYSTEM:    i64 = 8948;   // "system"
+pub(crate) const TOK_NEWLINE:   i64 = 198;    // "\n"
+pub(crate) const TOK_IM_END:    i64 = IM_END_TOKEN_ID; // 151645
+pub(crate) const TOK_USER:      i64 = 872;    // "user"
+pub(crate) const TOK_ASSISTANT: i64 = 77091;  // "assistant"
 
 /// Options controlling the transcription behaviour.
 ///
@@ -53,6 +53,20 @@ impl Default for TranscribeOptions {
     }
 }
 
+impl TranscribeOptions {
+    /// Set the maximum number of new tokens to generate.
+    pub fn with_max_new_tokens(mut self, max_new_tokens: usize) -> Self {
+        self.max_new_tokens = max_new_tokens;
+        self
+    }
+
+    /// Force a specific language (e.g. `"english"`).
+    pub fn with_language(mut self, language: impl Into<String>) -> Self {
+        self.language = Some(language.into());
+        self
+    }
+}
+
 #[non_exhaustive]
 pub struct TranscribeResult {
     pub text: String,
@@ -60,13 +74,13 @@ pub struct TranscribeResult {
     pub raw_output: String,
 }
 
-struct AsrInferenceInner {
-    audio_encoder: AudioEncoder,
-    text_decoder: TextDecoder,
-    mel_extractor: MelExtractor,
-    tokenizer: tokenizers::Tokenizer,
-    config: AsrConfig,
-    device: Device,
+pub(crate) struct AsrInferenceInner {
+    pub(crate) audio_encoder: AudioEncoder,
+    pub(crate) text_decoder: TextDecoder,
+    pub(crate) mel_extractor: MelExtractor,
+    pub(crate) tokenizer: tokenizers::Tokenizer,
+    pub(crate) config: AsrConfig,
+    pub(crate) device: Device,
 }
 
 // SAFETY: The raw pointers inside candle Metal tensors point to heap-allocated
@@ -76,7 +90,7 @@ struct AsrInferenceInner {
 unsafe impl Send for AsrInferenceInner {}
 
 pub struct AsrInference {
-    inner: Mutex<AsrInferenceInner>,
+    pub(crate) inner: Mutex<AsrInferenceInner>,
 }
 // AsrInference: Send + Sync automatically — Mutex<T>: Send+Sync when T: Send.
 
@@ -189,27 +203,54 @@ impl AsrInference {
 }
 
 impl AsrInferenceInner {
-    fn run_inference(
+    pub(crate) fn run_inference(
         &self,
         samples: &[f32],
         options: &TranscribeOptions,
     ) -> anyhow::Result<TranscribeResult> {
-        // Step 1: Mel spectrogram
+        let audio_embeds = self.encode_audio(samples)?;
+        let generated_ids = self.generate(
+            &audio_embeds,
+            options.language.as_deref(),
+            None, // no prefix
+            options.max_new_tokens,
+        )?;
+        self.decode_result(&generated_ids, options.language.as_deref())
+    }
+
+    /// Extract mel spectrogram and run the audio encoder.
+    /// Returns audio embeddings [num_audio_tokens, output_dim].
+    pub(crate) fn encode_audio(&self, samples: &[f32]) -> anyhow::Result<Tensor> {
         let (mel_data, n_mels, n_frames) = self.mel_extractor.extract(samples)?;
         debug!("Mel: {}×{} frames", n_mels, n_frames);
         let mel = Tensor::from_vec(mel_data, (n_mels, n_frames), &self.device)?;
-
-        // Step 2: Audio encoder
         let audio_embeds = self.audio_encoder.forward(&mel)?;
-        let num_audio_tokens = audio_embeds.dims()[0];
-        info!("Audio tokens: {}", num_audio_tokens);
+        info!("Audio tokens: {}", audio_embeds.dims()[0]);
+        Ok(audio_embeds)
+    }
 
-        // Step 3: Build prompt token IDs
+    /// Run the full decoder pipeline: build prompt, prefill, generate tokens.
+    ///
+    /// `prefix_text`: optional text to prepend to the assistant turn (for streaming
+    /// rollback). The prefix tokens are included in the prompt and the model
+    /// generates continuation tokens after them.
+    ///
+    /// Returns the raw generated token IDs (not including prompt/prefix tokens).
+    pub(crate) fn generate(
+        &self,
+        audio_embeds: &Tensor,
+        language: Option<&str>,
+        prefix_text: Option<&str>,
+        max_new_tokens: usize,
+    ) -> anyhow::Result<Vec<u32>> {
+        let num_audio_tokens = audio_embeds.dims()[0];
+
+        // Build prompt token IDs (with optional prefix)
         let (input_ids, audio_start_pos) =
-            self.build_prompt(num_audio_tokens, options.language.as_deref())?;
+            self.build_prompt(num_audio_tokens, language, prefix_text)?;
         let seq_len = input_ids.len();
 
-        // Step 4: Build embeddings, inject audio at the audio pad positions
+        // Build embeddings, inject audio at the audio pad positions
         let before_ids: Vec<i64> = input_ids[..audio_start_pos].to_vec();
         let after_ids: Vec<i64> = input_ids[audio_start_pos + num_audio_tokens..].to_vec();
 
@@ -224,17 +265,14 @@ impl AsrInferenceInner {
 
         let before_emb = self.text_decoder.embed(&before_t)?;
         let after_emb = self.text_decoder.embed(&after_t)?;
-        // Keep audio embeddings in their native dtype (BF16) to match embed dtype.
         let audio_emb = audio_embeds.to_dtype(before_emb.dtype())?;
 
         let hidden_states =
             Tensor::cat(&[&before_emb, &audio_emb, &after_emb], 0)?.unsqueeze(0)?;
-        // hidden_states: [1, seq_len, hidden]
 
-        // Step 5: Precompute the full MRoPE cos/sin table for prefill + all generation steps.
-        // Calling compute_mrope_cos_sin once avoids redundant trig computations.
+        // Precompute MRoPE cos/sin table
         let text_cfg = &self.config.thinker_config.text_config;
-        let total_positions = seq_len + options.max_new_tokens;
+        let total_positions = seq_len + max_new_tokens;
         let all_pos: Vec<i64> = (0..total_positions as i64).collect();
         let full_ids: [Vec<i64>; 3] = [all_pos.clone(), all_pos.clone(), all_pos.clone()];
         let (cos_table, sin_table) = compute_mrope_cos_sin(
@@ -245,13 +283,11 @@ impl AsrInferenceInner {
             text_cfg.mrope_interleaved(),
             &self.device,
         )?;
-        // cos_table / sin_table shape: [total_positions, head_dim]
 
-        // Prefill: take the first seq_len rows.
         let cos = cos_table.narrow(0, 0, seq_len)?;
         let sin = sin_table.narrow(0, 0, seq_len)?;
 
-        // Step 6: Prefill
+        // Prefill
         let mask = create_causal_mask(seq_len, 0, &self.device)?;
         let mut kv_cache = KvCache::new(text_cfg.num_hidden_layers);
 
@@ -263,20 +299,16 @@ impl AsrInferenceInner {
             Some(&mask),
         )?;
 
-        // Step 7: Autoregressive generation
+        // Autoregressive generation
         let mut generated_ids: Vec<u32> = Vec::new();
         let eos_ids: &[i64] = &[ENDOFTEXT_TOKEN_ID, IM_END_TOKEN_ID];
 
-        // logits: [1, seq_len, vocab]
-        let mut next_logits = logits.narrow(1, seq_len - 1, 1)?.squeeze(1)?; // [1, vocab]
-
+        let mut next_logits = logits.narrow(1, seq_len - 1, 1)?.squeeze(1)?;
         let mut current_pos = seq_len;
 
-        for step_idx in 0..options.max_new_tokens {
+        for step_idx in 0..max_new_tokens {
             let next_token = next_logits.argmax(1)?.to_vec1::<u32>()?[0];
 
-            // Debug: log top-10 logits at each step (only when debug level is enabled,
-            // guarded to avoid the expensive tensor ops when not needed).
             if log::log_enabled!(log::Level::Debug) {
                 let logits_f32 = next_logits.to_dtype(candle_core::DType::F32)?;
                 let logits_vec = logits_f32.to_vec2::<f32>()?[0].clone();
@@ -305,13 +337,11 @@ impl AsrInferenceInner {
 
             generated_ids.push(next_token);
 
-            // Embed next token
             let next_id_t =
                 Tensor::from_vec(vec![next_token], (1,), &self.device)?;
-            let next_emb = self.text_decoder.embed(&next_id_t)?.unsqueeze(0)?; // [1, 1, hidden]
+            let next_emb = self.text_decoder.embed(&next_id_t)?.unsqueeze(0)?;
 
-            // MRoPE for single new token: index into the precomputed table (O(1)).
-            let new_cos = cos_table.narrow(0, current_pos, 1)?; // [1, head_dim]
+            let new_cos = cos_table.narrow(0, current_pos, 1)?;
             let new_sin = sin_table.narrow(0, current_pos, 1)?;
 
             let past_len = kv_cache.seq_len();
@@ -325,20 +355,25 @@ impl AsrInferenceInner {
                 Some(&step_mask),
             )?;
 
-            next_logits = step_logits.squeeze(1)?; // [1, vocab]
+            next_logits = step_logits.squeeze(1)?;
             current_pos += 1;
         }
 
-        // Step 8: Decode
         info!("Generated {} tokens", generated_ids.len());
+        Ok(generated_ids)
+    }
+
+    /// Decode generated token IDs into a TranscribeResult.
+    pub(crate) fn decode_result(
+        &self,
+        generated_ids: &[u32],
+        language: Option<&str>,
+    ) -> anyhow::Result<TranscribeResult> {
         let raw_text = self
             .tokenizer
-            .decode(&generated_ids, true)
+            .decode(generated_ids, true)
             .map_err(|e| anyhow::anyhow!("decode: {}", e))?;
 
-        // Token 151704 is the ASR text separator in Qwen3-ASR but is absent from
-        // the base Qwen3-0.6B tokenizer (decodes to ""). Split on it directly.
-        let language = options.language.as_deref();
         let (lang, text) = if language.is_some() {
             ("forced".to_string(), raw_text.trim().to_string())
         } else if let Some(sep_pos) =
@@ -354,7 +389,6 @@ impl AsrInferenceInner {
                 .tokenizer
                 .decode(&text_ids, true)
                 .map_err(|e| anyhow::anyhow!("decode text: {}", e))?;
-            // lang_raw is like "language English" → strip prefix
             let lang =
                 lang_raw.strip_prefix("language ").unwrap_or(&lang_raw).trim().to_string();
             (lang, text_raw.trim().to_string())
@@ -364,10 +398,29 @@ impl AsrInferenceInner {
         Ok(TranscribeResult { text, language: lang, raw_output: raw_text })
     }
 
-    fn build_prompt(
+    /// Encode text into token IDs using the tokenizer.
+    #[allow(dead_code)]
+    pub(crate) fn tokenizer_encode(&self, text: &str) -> anyhow::Result<Vec<u32>> {
+        let enc = self
+            .tokenizer
+            .encode(text, false)
+            .map_err(|e| anyhow::anyhow!("encode: {}", e))?;
+        Ok(enc.get_ids().to_vec())
+    }
+
+    /// Decode token IDs into text using the tokenizer.
+    pub(crate) fn tokenizer_decode(&self, ids: &[u32]) -> anyhow::Result<String> {
+        self.tokenizer
+            .decode(ids, true)
+            .map_err(|e| anyhow::anyhow!("decode: {}", e))
+    }
+
+    /// Build prompt token IDs with optional prefix text in the assistant turn.
+    pub(crate) fn build_prompt(
         &self,
         num_audio_tokens: usize,
         language: Option<&str>,
+        prefix_text: Option<&str>,
     ) -> anyhow::Result<(Vec<i64>, usize)> {
         let cfg = &self.config.thinker_config;
         let mut tokens: Vec<i64> = vec![
@@ -404,6 +457,17 @@ impl AsrInferenceInner {
         } else {
             tokens.push(TOK_ASSISTANT);
             tokens.push(TOK_NEWLINE);
+        }
+
+        // Append prefix text tokens (for streaming rollback)
+        if let Some(prefix) = prefix_text {
+            if !prefix.is_empty() {
+                let enc = self
+                    .tokenizer
+                    .encode(prefix, false)
+                    .map_err(|e| anyhow::anyhow!("encode prefix: {}", e))?;
+                tokens.extend(enc.get_ids().iter().map(|&id| id as i64));
+            }
         }
 
         Ok((tokens, audio_start_pos))

@@ -8,7 +8,7 @@ repository = "https://github.com/alan890104/qwen3-asr-rs"
 keywords = ["asr", "speech-recognition", "qwen3", "candle", "whisper"]
 categories = ["multimedia::audio", "science"]
 readme = "README.md"
-include = ["src/**/*.rs", "examples/**/*.rs", "README.md", "LICENSE"]
+include = ["src/**/*.rs", "README.md", "LICENSE"]
 rust-version = "1.75"
 
 [features]

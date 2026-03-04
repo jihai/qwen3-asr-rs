@@ -24,3 +24,6 @@ bench.sh
 
 # Internal compatibility test crate
 compat_test/
+
+# Claude Code
+CLAUDE.md

@@ -7,7 +7,6 @@
 //! Set CACHE_DIR env var to change cache location (default: models/).
 
 use anyhow::Result;
-use candle_core::Device;
 use qwen3_asr::{AsrInference, TranscribeOptions};
 use std::path::Path;
 
@@ -19,7 +18,7 @@ fn main() -> Result<()> {
     let cache_dir = std::env::var("CACHE_DIR")
         .unwrap_or_else(|_| "models".to_string());
 
-    let device = Device::new_metal(0).unwrap_or(Device::Cpu);
+    let device = qwen3_asr::best_device();
     eprintln!("Device    : {device:?}");
     eprintln!("Model     : {model_id}");
     eprintln!("Cache dir : {cache_dir}");
