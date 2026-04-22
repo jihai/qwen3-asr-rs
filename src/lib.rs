@@ -7,6 +7,7 @@ pub(crate) mod hub;
 mod inference;
 mod linear;
 mod mel;
+mod path_utils;
 mod streaming;
 
 pub use encoder::EncoderCache;
