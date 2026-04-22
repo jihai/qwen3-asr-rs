@@ -1,9 +1,13 @@
+use crate::path_utils::{cache_leaf_from_model_id, join_safe_relative};
 use anyhow::Context;
 use log::info;
 use std::path::Path;
 
 pub(crate) fn hf_url(model_id: &str, filename: &str) -> String {
-    format!("https://huggingface.co/{}/resolve/main/{}", model_id, filename)
+    format!(
+        "https://huggingface.co/{}/resolve/main/{}",
+        model_id, filename
+    )
 }
 
 /// Make a GET request; returns `None` on 404, error on other failures.
@@ -43,12 +47,17 @@ pub(crate) fn hf_stream_to_file(url: &str, path: &std::path::Path) -> anyhow::Re
     if !resp.status().is_success() {
         anyhow::bail!("HTTP {} for {}", resp.status(), url);
     }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
     let mut file = std::fs::File::create(path)?;
     let mut downloaded = 0u64;
     let mut buf = [0u8; 65536];
     loop {
         let n = resp.read(&mut buf)?;
-        if n == 0 { break; }
+        if n == 0 {
+            break;
+        }
         file.write_all(&buf[..n])?;
         downloaded += n as u64;
     }
@@ -63,8 +72,11 @@ pub(crate) fn hf_stream_to_file(url: &str, path: &std::path::Path) -> anyhow::Re
 /// A `.complete` marker file signals that all files are present. If the
 /// directory exists but `.complete` is missing (interrupted download), the
 /// directory is removed and the download restarts.
-pub(crate) fn ensure_model_cached(model_id: &str, cache_dir: &Path) -> anyhow::Result<std::path::PathBuf> {
-    let sanitized = model_id.replace('/', "--");
+pub(crate) fn ensure_model_cached(
+    model_id: &str,
+    cache_dir: &Path,
+) -> anyhow::Result<std::path::PathBuf> {
+    let sanitized = cache_leaf_from_model_id(model_id).context("invalid model_id")?;
     let model_dir = cache_dir.join(&sanitized);
     let marker = model_dir.join(".complete");
 
@@ -80,12 +92,16 @@ pub(crate) fn ensure_model_cached(model_id: &str, cache_dir: &Path) -> anyhow::R
         std::fs::remove_dir_all(&model_dir)?;
     }
 
-    info!("Downloading '{}' from HuggingFace to {}…", model_id, model_dir.display());
+    info!(
+        "Downloading '{}' from HuggingFace to {}…",
+        model_id,
+        model_dir.display()
+    );
     std::fs::create_dir_all(&model_dir)?;
 
     // config.json
-    let config_bytes = hf_get_bytes(&hf_url(model_id, "config.json"))
-        .context("download config.json")?;
+    let config_bytes =
+        hf_get_bytes(&hf_url(model_id, "config.json")).context("download config.json")?;
     std::fs::write(model_dir.join("config.json"), &config_bytes)?;
 
     // Weights: check for sharded index first.
@@ -102,7 +118,9 @@ pub(crate) fn ensure_model_cached(model_id: &str, cache_dir: &Path) -> anyhow::R
             .filter_map(|v| v.as_str().map(str::to_string))
             .collect();
         for shard in &shards {
-            hf_stream_to_file(&hf_url(model_id, shard), &model_dir.join(shard))
+            let shard_path = join_safe_relative(&model_dir, shard, "shard filename")
+                .with_context(|| format!("invalid shard filename '{}'", shard))?;
+            hf_stream_to_file(&hf_url(model_id, shard), &shard_path)
                 .with_context(|| format!("download shard {}", shard))?;
         }
     } else {
@@ -138,7 +156,11 @@ pub(crate) fn ensure_model_cached(model_id: &str, cache_dir: &Path) -> anyhow::R
 /// Build the Qwen3 tokenizer JSON from vocab.json, merges.txt, and tokenizer_config.json.
 /// The added_tokens list is derived from tokenizer_config.json's added_tokens_decoder field,
 /// so no special tokens need to be hardcoded here.
-fn build_qwen3_tokenizer_json(vocab: &str, merges: &str, tok_config: &str) -> anyhow::Result<Vec<u8>> {
+fn build_qwen3_tokenizer_json(
+    vocab: &str,
+    merges: &str,
+    tok_config: &str,
+) -> anyhow::Result<Vec<u8>> {
     let vocab_val: serde_json::Value = serde_json::from_str(vocab)?;
     let merges_vec: Vec<&str> = merges
         .lines()
@@ -218,4 +240,38 @@ fn build_qwen3_tokenizer_json(vocab: &str, merges: &str, tok_config: &str) -> an
     });
 
     serde_json::to_vec(&tokenizer_json).map_err(Into::into)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn unique_temp_dir(prefix: &str) -> std::path::PathBuf {
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("{prefix}-{}-{ts}", std::process::id()))
+    }
+
+    #[test]
+    fn reject_model_id_traversal_before_mutating_filesystem() {
+        // This mirrors an old exploit path:
+        // model_id=".." would map cache_dir/.. and trigger remove_dir_all on parent.
+        let root = unique_temp_dir("qwen3-asr-hub-test");
+        let cache_dir = root.join("cache");
+        let sentinel = root.join("sentinel.txt");
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        std::fs::write(&sentinel, b"keep").unwrap();
+
+        let result = ensure_model_cached("..", &cache_dir);
+        assert!(result.is_err());
+        assert!(
+            sentinel.exists(),
+            "traversal attempt must be rejected before touching parent paths"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }
