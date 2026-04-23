@@ -27,3 +27,9 @@ compat_test/
 
 # Claude Code
 CLAUDE.md
+
+# Knowledge base (internal notes, expose later)
+/knowledge/
+
+# Local transcript captures (private runtime artifacts)
+/transcripts/
