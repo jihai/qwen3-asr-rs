@@ -14,7 +14,7 @@
 
 use std::io::Write;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
 
@@ -129,27 +129,68 @@ fn main() -> anyhow::Result<()> {
     let mic_config = mic.default_input_config()?;
     let sample_rate = mic_config.sample_rate().0;
     let channels = mic_config.channels() as usize;
-    eprintln!("Mic config: {}Hz, {} ch", sample_rate, channels);
+    let sample_format = mic_config.sample_format();
+    eprintln!(
+        "Mic config: {}Hz, {} ch, {:?}",
+        sample_rate, channels, sample_format
+    );
 
-    let (tx, rx) = mpsc::channel::<Vec<f32>>();
+    // Keep capture queue bounded so slow inference cannot accumulate unbounded audio.
+    const CAPTURE_QUEUE_CAPACITY: usize = 8;
+    let (tx, rx) = mpsc::sync_channel::<Vec<f32>>(CAPTURE_QUEUE_CAPACITY);
+    let dropped_chunks = Arc::new(AtomicUsize::new(0));
 
     let needs_resample = sample_rate != 16000;
+    let stream_config = mic_config.config();
 
-    let stream = mic.build_input_stream(
-        &mic_config.into(),
-        move |data: &[f32], _: &cpal::InputCallbackInfo| {
-            let mono: Vec<f32> = if channels == 1 {
-                data.to_vec()
-            } else {
-                data.chunks(channels)
-                    .map(|frame| frame.iter().sum::<f32>() / channels as f32)
-                    .collect()
-            };
-            let _ = tx.send(mono);
-        },
-        |err| eprintln!("Audio stream error: {}", err),
-        None,
-    )?;
+    let stream = match sample_format {
+        cpal::SampleFormat::F32 => {
+            let tx = tx.clone();
+            let dropped_chunks = dropped_chunks.clone();
+            mic.build_input_stream(
+                &stream_config,
+                move |data: &[f32], _: &cpal::InputCallbackInfo| {
+                    let mono = downmix_to_mono(data, channels, |s| s);
+                    try_send_chunk(&tx, &dropped_chunks, mono);
+                },
+                |err| eprintln!("Audio stream error: {}", err),
+                None,
+            )?
+        }
+        cpal::SampleFormat::I16 => {
+            let tx = tx.clone();
+            let dropped_chunks = dropped_chunks.clone();
+            mic.build_input_stream(
+                &stream_config,
+                move |data: &[i16], _: &cpal::InputCallbackInfo| {
+                    let mono = downmix_to_mono(data, channels, |s| s as f32 / i16::MAX as f32);
+                    try_send_chunk(&tx, &dropped_chunks, mono);
+                },
+                |err| eprintln!("Audio stream error: {}", err),
+                None,
+            )?
+        }
+        cpal::SampleFormat::U16 => {
+            let tx = tx.clone();
+            let dropped_chunks = dropped_chunks.clone();
+            mic.build_input_stream(
+                &stream_config,
+                move |data: &[u16], _: &cpal::InputCallbackInfo| {
+                    let mono =
+                        downmix_to_mono(data, channels, |s| (s as f32 - 32768.0) / 32768.0);
+                    try_send_chunk(&tx, &dropped_chunks, mono);
+                },
+                |err| eprintln!("Audio stream error: {}", err),
+                None,
+            )?
+        }
+        other => {
+            return Err(anyhow::anyhow!(
+                "Unsupported input sample format: {:?}",
+                other
+            ));
+        }
+    };
     stream.play()?;
 
     // Ctrl+C handler
@@ -164,6 +205,8 @@ fn main() -> anyhow::Result<()> {
     // Output state: track committed (permanent) text vs active (evolving) tail
     let mut committed = String::new();
     let mut last_text = String::new();
+    let mut dropped_since_report = 0usize;
+    let mut last_drop_report = std::time::Instant::now();
 
     // Resampler state
     let resample_block = 1024usize;
@@ -183,6 +226,19 @@ fn main() -> anyhow::Result<()> {
     };
 
     while running.load(Ordering::Relaxed) {
+        dropped_since_report += dropped_chunks.swap(0, Ordering::Relaxed);
+        if dropped_since_report > 0
+            && last_drop_report.elapsed() >= std::time::Duration::from_secs(2)
+        {
+            eprint!("\r\x1b[2K");
+            eprintln!(
+                "[warn] Dropped {} audio chunk(s): capture queue was full",
+                dropped_since_report
+            );
+            dropped_since_report = 0;
+            last_drop_report = std::time::Instant::now();
+        }
+
         let chunk = match rx.recv_timeout(std::time::Duration::from_millis(100)) {
             Ok(c) => c,
             Err(mpsc::RecvTimeoutError::Timeout) => continue,
@@ -218,6 +274,15 @@ fn main() -> anyhow::Result<()> {
             Ok(None) => {}
             Err(e) => eprintln!("\nInference error: {}", e),
         }
+    }
+
+    dropped_since_report += dropped_chunks.swap(0, Ordering::Relaxed);
+    if dropped_since_report > 0 {
+        eprint!("\r\x1b[2K");
+        eprintln!(
+            "[warn] Dropped {} audio chunk(s): capture queue was full",
+            dropped_since_report
+        );
     }
 
     // Finalize
@@ -363,3 +428,34 @@ fn local_date_string() -> String {
     }
 }
 
+fn downmix_to_mono<T, F>(data: &[T], channels: usize, mut convert: F) -> Vec<f32>
+where
+    T: Copy,
+    F: FnMut(T) -> f32,
+{
+    if channels <= 1 {
+        return data.iter().copied().map(convert).collect();
+    }
+
+    let mut mono = Vec::with_capacity(data.len() / channels + 1);
+    for frame in data.chunks(channels) {
+        let sum: f32 = frame.iter().copied().map(&mut convert).sum();
+        mono.push(sum / frame.len() as f32);
+    }
+    mono
+}
+
+fn try_send_chunk(
+    tx: &mpsc::SyncSender<Vec<f32>>,
+    dropped_chunks: &AtomicUsize,
+    chunk: Vec<f32>,
+) {
+    if let Err(err) = tx.try_send(chunk) {
+        match err {
+            mpsc::TrySendError::Full(_) => {
+                dropped_chunks.fetch_add(1, Ordering::Relaxed);
+            }
+            mpsc::TrySendError::Disconnected(_) => {}
+        }
+    }
+}
